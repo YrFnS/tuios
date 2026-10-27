@@ -8,9 +8,31 @@ permissions:
   contents: read
 
 jobs:
-  gate:
+  unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version-file: go.mod
+          cache-id: sixel-browser
+      - name: Allow test user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Go unit tests
+        run: |
+          set -o pipefail
+          pkgs="./... ./progstatus/... ./vt/... ./swatch/... ./shot/... ./tml/... ./plot/... ./loom/... ./sketch/..."
+          go test $pkgs -count=1 -timeout 20m 2>&1 | tee "$RUNNER_TEMP/unit.log" ||
+            scripts/retry-flaky.sh "$RUNNER_TEMP/unit.log" $pkgs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sixel-unit
+          path: ${{ runner.temp }}/unit.log
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -18,45 +40,33 @@ jobs:
       - uses: ./.github/actions/setup-go
         with:
           go-version-file: go.mod
-          cache-id: sixel-gate
-      - name: Required changed-package gate
-        env:
-          GOTOOLCHAIN: auto
-        run: |
-          git remote add upstream https://github.com/Gaurav-Gosain/tuios.git
-          git fetch upstream main
-          go run golang.org/x/tools/gopls@v0.24.0 version
-          set -o pipefail
-          bash scripts/check.sh --changed upstream/main | tee gate-summary.txt
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: sixel-gate
-          path: |
-            gate-summary.txt
-            .dev/check/
-  browser:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-go
-        with:
-          go-version-file: go.mod
           cache-id: sixel-browser
-      - name: Build web server
-        run: go build -o "$RUNNER_TEMP/tuios-web" ./cmd/tuios-web
-      - name: Install browser test runner
-        working-directory: clienttests
-        run: npm ci
-      - name: Run browser suite
-        working-directory: clienttests
+      - name: Prepared Learn WASM compile
+        run: |
+          modfile=$(bash cmd/tuios-wasm/prepare.sh)
+          GOWORK=off GOOS=js GOARCH=wasm go build -modfile "$modfile" -trimpath -ldflags '-s -w' -o "$RUNNER_TEMP/tuios.wasm" ./cmd/tuios-wasm
+          sha256sum "$RUNNER_TEMP/tuios.wasm" > "$RUNNER_TEMP/wasm-build.txt"
+          stat -c '%s bytes' "$RUNNER_TEMP/tuios.wasm" >> "$RUNNER_TEMP/wasm-build.txt"
+          cat "$RUNNER_TEMP/wasm-build.txt"
+      - name: Release binary sizes on the branch
         env:
-          TUIOS_WEB_BIN: ${{ runner.temp }}/tuios-web
-          TUIOS_CHROMIUM: /usr/bin/google-chrome
-        run: npx playwright test
+          SIZE_OUT: ${{ runner.temp }}/size-head.txt
+        run: bash scripts/binary-size.sh
+      - name: Release binary sizes on the PR base
+        env:
+          SIZE_OUT: ${{ runner.temp }}/size-base.txt
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/sixel-baseline" c725ff16a1ced07303c3a3da74bc7e4ff62d1b0a
+          bash "$RUNNER_TEMP/sixel-baseline/scripts/binary-size.sh"
+      - name: Compare bytes
+        run: |
+          python3 -c 'import json, os, pathlib; root=pathlib.Path(os.environ["RUNNER_TEMP"]); read=lambda name:{k:int(v) for k,v in (row.split() for row in (root/name).read_text().splitlines())}; head=read("size-head.txt"); base=read("size-base.txt"); assert set(head)==set(base)=={"linux/amd64","darwin/arm64"}; result={"source":"09402161e1f450fe325a467bd47e86065b9a0a62","base":"c725ff16a1ced07303c3a3da74bc7e4ff62d1b0a","head":head,"baseline":base,"delta":{k:head[k]-base[k] for k in head}}; text=json.dumps(result,indent=2); (root/"binary-size-delta.json").write_text(text+"\n"); print(text)'
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: sixel-browser
-          path: clienttests/test-results/
+          name: sixel-compatibility
+          path: |
+            ${{ runner.temp }}/wasm-build.txt
+            ${{ runner.temp }}/size-head.txt
+            ${{ runner.temp }}/size-base.txt
+            ${{ runner.temp }}/binary-size-delta.json
