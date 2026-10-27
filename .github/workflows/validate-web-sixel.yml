@@ -1,0 +1,62 @@
+name: Validate browser sixel fix
+
+on:
+  push:
+    branches: [chore/validate-web-sixel]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version-file: go.mod
+          cache-id: sixel-gate
+      - name: Required changed-package gate
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          git remote add upstream https://github.com/Gaurav-Gosain/tuios.git
+          git fetch upstream main
+          go run golang.org/x/tools/gopls@v0.24.0 version
+          set -o pipefail
+          bash scripts/check.sh --changed upstream/main | tee gate-summary.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sixel-gate
+          path: |
+            gate-summary.txt
+            .dev/check/
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version-file: go.mod
+          cache-id: sixel-browser
+      - name: Build web server
+        run: go build -o "$RUNNER_TEMP/tuios-web" ./cmd/tuios-web
+      - name: Install browser test runner
+        working-directory: clienttests
+        run: npm ci
+      - name: Run browser suite
+        working-directory: clienttests
+        env:
+          TUIOS_WEB_BIN: ${{ runner.temp }}/tuios-web
+          TUIOS_CHROMIUM: /usr/bin/google-chrome
+        run: npx playwright test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sixel-browser
+          path: clienttests/test-results/
